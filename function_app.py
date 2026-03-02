@@ -62,6 +62,7 @@ HOURLY_VARS = [
 CONTAINER = os.getenv("DATALAKE_CONTAINER", "datalake")
 BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "bronze/openmeteo")
 WATERMARK_BLOB = os.getenv("WATERMARK_BLOB", "bronze/_meta/weather_watermark.json")
+MANIFEST_PREFIX = os.getenv("MANIFEST_PREFIX", "bronze/_meta/manifests")
 
 
 def _utcnow_ts() -> str:
@@ -206,39 +207,78 @@ def weather_ingest_http(req: func.HttpRequest) -> func.HttpResponse:
         cc = bsc.get_container_client(CONTAINER)
         _ensure_container(cc)
         run_ts = _utcnow_ts()
+        t0 = time.perf_counter()
+        started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        wm_before = _download_watermark(cc)
 
         written = []
         for c in CITIES:
-            data = _call_open_meteo(c["lat"], c["lon"], start_date, end_date)
-            payload = {
-                "run_ts": run_ts,
-                "source": "open-meteo",
-                "city": c,
-                "request": {
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "hourly": HOURLY_VARS,
-                },
-                "response": data,
-            }
+            try:
+                data = _call_open_meteo(c["lat"], c["lon"], start_date, end_date)
+                payload = {
+                    "run_ts": run_ts,
+                    "source": "open-meteo",
+                    "city": c,
+                    "request": {
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "hourly": HOURLY_VARS,
+                    },
+                    "response": data,
+                }
 
-            blob_name = (
-                f"{BRONZE_PREFIX}/dt={start_date}/city={c['city_id']}/run_ts={run_ts}.json"
-            )
-            _upload_json(cc, blob_name, payload)
-            written.append({"city_id": c["city_id"], "blob": blob_name})
+                blob_name = f"{BRONZE_PREFIX}/dt={start_date}/city={c['city_id']}/run_ts={run_ts}.json"
+                _upload_json(cc, blob_name, payload)
+                written.append(
+                    {"city_id": c["city_id"], "status": "success", "blob": blob_name}
+                )
+            except Exception as e:
+                written.append(
+                    {"city_id": c["city_id"], "status": "failed", "error": str(e)}
+                )
 
-        wm = _download_watermark(cc)
-        wm["last_loaded_date"] = end_date
-        wm["updated_at_utc"] = run_ts
-        _upload_json(cc, WATERMARK_BLOB, wm)
+        finished_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+
+        cities_success = sum(1 for r in written if r.get("status") == "success")
+        cities_failed = sum(1 for r in written if r.get("status") == "failed")
+        all_ok = cities_failed == 0
+
+        wm_after = dict(wm_before)
+        if all_ok:
+            wm_after["last_loaded_date"] = end_date
+            wm_after["updated_at_utc"] = run_ts
+            _upload_json(cc, WATERMARK_BLOB, wm_after)
+        else:
+            _upload_json(cc, WATERMARK_BLOB, wm_before)
+
+        manifest = {
+            "run_ts": run_ts,
+            "requested": {"start_date": start_date, "end_date": end_date},
+            "started_at_utc": started_at_utc,
+            "finished_at_utc": finished_at_utc,
+            "duration_ms": duration_ms,
+            "watermark_before": wm_before,
+            "watermark_after": wm_after if all_ok else wm_before,
+            "summary": {
+                "cities_total": len(CITIES),
+                "cities_success": cities_success,
+                "cities_failed": cities_failed,
+            },
+            "outputs": written,
+        }
+
+        manifest_blob = f"{MANIFEST_PREFIX}/dt={start_date}/run_ts={run_ts}.json"
+        _upload_json(cc, manifest_blob, manifest)
 
         return func.HttpResponse(
             json.dumps(
                 {
-                    "ok": True,
+                    "ok": all_ok,
                     "start_date": start_date,
                     "end_date": end_date,
+                    "summary": manifest["summary"],
+                    "manifest_blob": manifest_blob,
                     "written": written,
                 },
                 ensure_ascii=False,
